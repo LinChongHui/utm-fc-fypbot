@@ -12,15 +12,66 @@
   /* The color variables have successfully moved to global scope blocks! */
 }
 
-/* ── Top bar ── */
+/* ── Top bar (Enhanced & Roomier) ── */
 .admin-topbar { 
-  display: flex; align-items: center; justify-content: space-between; 
-  padding: 0 1.5rem; height: 56px; background: var(--bg-surface); 
-  border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; flex-shrink: 0; 
+  display: flex; 
+  align-items: center; 
+  justify-content: space-between; 
+  padding: 0 1.5rem; 
+  height: 64px; /* Increased from 56px to provide an elegant, spacious frame */
+  background: var(--bg-surface); 
+  border-bottom: 1px solid var(--border); 
+  position: sticky; 
+  top: 0; 
+  z-index: 10; 
+  flex-shrink: 0; 
 }
-.admin-logo { font-size: 15px; font-weight: 600; color: var(--text-primary); }
-.admin-topbar-right { display: flex; align-items: center; gap: 10px; }
-.admin-user-email { font-size: 13px; color: var(--text-secondary); }
+
+.admin-logo { 
+  font-size: 16px; /* Bumped up slightly for better visibility */
+  font-weight: 600; 
+  color: var(--text-primary); 
+  white-space: nowrap;
+  letter-spacing: -0.01em;
+}
+
+.admin-topbar-right { 
+  display: flex; 
+  align-items: center; 
+  gap: 16px; /* Increased gap from 10px to separate the actions cleanly */
+}
+
+.admin-user-email { 
+  font-size: 13px; 
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+/* ── Mobile View Adjustments ── */
+@media (max-width: 480px) {
+  .admin-topbar {
+    height: 60px; /* Comfortable height for mobile headers */
+    padding: 0 1rem; /* Slight optimization to maintain content width edge-to-edge */
+  }
+  
+  .admin-logo {
+    font-size: 14px; /* Perfectly readable without wrapping */
+    font-weight: 700;
+  }
+
+  .admin-topbar-right {
+    gap: 12px; /* Balanced spacing for interactive touches on smaller displays */
+  }
+
+  /* Keeps your admin email layout from making the bar cramped or wrapped on phone screens */
+  .admin-user-email {
+    font-size: 12px;
+    max-width: 140px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
 .icon-btn { 
   background: transparent; border: none; cursor: pointer; padding: 6px; 
   border-radius: 6px; font-size: 16px; line-height: 1; color: var(--text-secondary); 
@@ -294,4 +345,13 @@
   --ai-accent-border: rgba(112, 72, 232, 0.25);
 }
 
-
+/* Add this responsive breakpoint rule at the bottom of your file */
+@media (max-width: 480px) {
+  .admin-logo {
+    font-size: 13px; /* Slightly downsized to keep it clean on compact mobile headers */
+    font-weight: 700;
+  }
+  .admin-topbar {
+    padding: 0 0.75rem; /* Reduces container padding to save horizontal space on phone screens */
+  }
+}

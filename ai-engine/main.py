@@ -15,6 +15,8 @@ Features:
 ✅ Clean short answers with strict citation context constraints
 ✅ Vision image description injection into RAG context pipeline
 ✅ Safe Chroma DB release before rebuild (fixes Windows file lock)
+✅ LLM-Driven Multi-Query Expansion (Method 1: Dynamic campus synonym rewriting)
+✅ Hybrid Substring Matching Fallback for Content-Poor / Brief Queries
 """
 
 import os
@@ -22,6 +24,8 @@ import re
 import gc
 import base64
 from datetime import datetime
+import time
+import ollama
 
 import httpx
 from fastapi import FastAPI
@@ -183,6 +187,40 @@ print(f"✅ Total chunk segments after text split: {len(docs)}")
 DB_PATH   = "./chroma_db_local"
 HASH_FILE = "./chroma_db_local/.kb_fingerprint"
 
+def reload_vectorstore(retries=5, delay=2):
+    """Recreate the Chroma client from scratch after a DB rebuild."""
+    global vectorstore  # or however you store it in main.py
+
+    for attempt in range(1, retries + 1):
+        try:
+            # ✅ Step 1: Fully destroy the old client
+            try:
+                del vectorstore
+            except Exception:
+                pass
+            gc.collect()
+
+            # ✅ Step 2: Wait briefly for filesystem to settle
+            time.sleep(1)
+
+            # ✅ Step 3: Recreate from scratch — don't reuse old object
+            embeddings = OllamaEmbeddings(model="nomic-embed-text")
+            vectorstore = Chroma(
+                persist_directory=DB_PATH,
+                embedding_function=embeddings,
+                collection_name="psm_utm_kb",
+            )
+
+            # ✅ Step 4: Test the connection
+            vectorstore.get()  # triggers actual DB access
+            print("✅ Vectorstore reloaded successfully.")
+            return vectorstore
+
+        except Exception as e:
+            print(f"⏳ Reload attempt {attempt}/{retries} failed — retrying in {delay}s... ({e})")
+            time.sleep(delay)
+
+    raise RuntimeError("❌ Vectorstore reload failed after all attempts.")
 
 def compute_kb_fingerprint() -> str:
     try:
@@ -238,8 +276,17 @@ def save_fingerprint(fingerprint: str):
 # CHROMA VECTORSTORE — GLOBAL HANDLE + LIFECYCLE MANAGEMENT
 # ─────────────────────────────────────────────────────────────
 
-# Single global reference — always access via get_vectorstore()
 _vectorstore: Chroma | None = None
+
+
+def clear_chroma_system_cache():
+    """Clear Chroma's per-process client cache before reconnecting to a rebuilt DB."""
+    try:
+        from chromadb.api.client import SharedSystemClient
+        SharedSystemClient.clear_system_cache()
+        print("Chroma system cache cleared.")
+    except Exception as e:
+        print(f"Could not clear Chroma system cache: {e}")
 
 
 def release_vectorstore():
@@ -251,12 +298,12 @@ def release_vectorstore():
     global _vectorstore
     if _vectorstore is not None:
         try:
-            # Stop the underlying Chroma system — closes SQLite + .bin files
             _vectorstore._client._system.stop()
             print("🔓 Chroma client released.")
         except Exception as e:
             print(f"⚠️  Could not cleanly stop Chroma client: {e}")
         _vectorstore = None
+    clear_chroma_system_cache()
     gc.collect()
 
 
@@ -322,7 +369,7 @@ def wipe_chroma_db(retries: int = 5, delay: int = 2):
             else:
                 raise RuntimeError(
                     f"\n❌ Cannot delete '{DB_PATH}' after {retries} attempts.\n"
-                    f"   Kill remaining python processes:  Get-Process python | Stop-Process -Force\n"
+                    f"   Kill remaining python processes:   Get-Process python | Stop-Process -Force\n"
                     f"   Original error: {e}"
                 )
 
@@ -381,6 +428,14 @@ async def stream_subprocess(cmd: list, cwd: str = None):
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    force_rebuild = (
+        current_fingerprint
+        and current_fingerprint == saved_fingerprint
+        and os.path.exists(DB_PATH)
+        and (get_vectorstore() is None or retriever is None)
+    )
+    if force_rebuild:
+        env["FORCE_REBUILD"] = "1"
 
     process = await asyncio.create_subprocess_exec(
         *cmd,
@@ -419,27 +474,28 @@ async def stream_subprocess(cmd: list, cwd: str = None):
 
 # ─────────────────────────────────────────────────────────────
 # ENDPOINT: /run-rebuild
-# Releases Chroma BEFORE spawning rebuild_db.py so Windows
-# doesn't lock the files in the subprocess.
-# After rebuild completes, reloads the vectorstore + retriever.
 # ─────────────────────────────────────────────────────────────
-
+ 
 @app.post("/run-rebuild")
 async def run_rebuild():
+    # Release main.py's own handle on the OLD DB before rebuild starts.
+    # This is critical on Windows — rebuild_db.py needs to move the old
+    # folder, but it can't if main.py still holds file locks on it.
     release_vectorstore()
-
+ 
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
-
+ 
     process = await asyncio.create_subprocess_exec(
         "python", "-u", "rebuild_db.py",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         env=env,
     )
-
+ 
     async def generate():
+        # Stream all output from rebuild_db.py line by line
         while True:
             line = await process.stdout.readline()
             if not line:
@@ -447,58 +503,88 @@ async def run_rebuild():
             text = line.decode("utf-8", errors="replace").rstrip()
             if text:
                 yield f"data: {text}\n\n"
-
+ 
         await process.wait()
         exit_code = process.returncode
-
+ 
         if exit_code == 0:
-            # ── Wait for DB files to be fully flushed by the OS ──
-            await asyncio.sleep(2)
-
-            # ── Verify the DB folder actually exists before loading ──
+            # ── Give the OS time to settle after the folder swap ──────────
+            yield "data: ⏳ Waiting for DB swap to settle on disk...\n\n"
+            await asyncio.sleep(4)
+ 
+            # ── Confirm the DB folder exists after swap ───────────────────
             if not os.path.exists(DB_PATH):
-                yield "data: ❌ Rebuild reported success but DB folder is missing.\n\n"
+                yield "data: ❌ DB folder missing after rebuild — something went wrong.\n\n"
                 yield "data: __DONE__\n\n"
                 return
-
-            # ── Retry loop: Chroma sometimes needs a moment after subprocess exits ──
+ 
+            # ── Wait until chroma.sqlite3 file actually exists ────────────
+            # The folder can exist but the SQLite file may still be mid-write.
+            # Connecting before it's ready causes "default_tenant" error.
+            sqlite_path = os.path.join(DB_PATH, "chroma.sqlite3")
+            yield "data: 🔍 Verifying chroma.sqlite3 is ready...\n\n"
+            for _ in range(20):
+                if os.path.exists(sqlite_path):
+                    break
+                await asyncio.sleep(1)
+            else:
+                yield "data: ❌ chroma.sqlite3 never appeared — rebuild may have failed silently.\n\n"
+                yield "data: __DONE__\n\n"
+                return
+ 
+            yield "data: ✅ SQLite DB file confirmed on disk.\n\n"
+ 
+            # ── Clear the Chroma system cache before reconnecting ─────────
+            # Without this, Chroma may reuse a stale in-process client
+            # that points to the old (now deleted) DB path.
+            try:
+                from chromadb.api.client import SharedSystemClient
+                SharedSystemClient.clear_system_cache()
+                yield "data: 🧹 Chroma system cache cleared.\n\n"
+            except Exception as cache_err:
+                yield f"data: ⚠️  Cache clear skipped: {cache_err}\n\n"
+ 
+            # ── Retry connecting to the freshly swapped DB ────────────────
             max_attempts = 5
             for attempt in range(1, max_attempts + 1):
                 try:
+                    # Always sleep before connecting — gives Chroma tenant
+                    # initialisation time to complete its internal SQLite writes
+                    await asyncio.sleep(3)
+ 
                     new_vs = Chroma(
                         persist_directory=DB_PATH,
                         embedding_function=embeddings,
                         collection_name="psm_utm_kb",
                     )
-
-                    # Validate the collection is actually queryable
+ 
                     count = new_vs._collection.count()
                     yield f"data: 📊 Collection verified: {count} vectors loaded.\n\n"
-
+ 
                     set_vectorstore(new_vs)
-
+ 
                     global retriever
                     retriever = new_vs.as_retriever(
                         search_type="mmr",
                         search_kwargs={"k": 3, "fetch_k": 10},
                     )
-
+ 
                     yield "data: 🔄 Vectorstore reloaded into main process.\n\n"
                     yield "data: ✅ Rebuild complete — chatbot is using fresh knowledge.\n\n"
                     break
-
+ 
                 except Exception as e:
                     if attempt < max_attempts:
-                        yield f"data: ⏳ Reload attempt {attempt}/{max_attempts} failed — retrying in 2s... ({e})\n\n"
-                        await asyncio.sleep(2)
+                        yield f"data: ⏳ Reload attempt {attempt}/{max_attempts} failed — retrying in 3s... ({e})\n\n"
+                        await asyncio.sleep(3)
                     else:
                         yield f"data: ❌ Vectorstore reload failed after {max_attempts} attempts: {e}\n\n"
                         yield "data: ⚠️  Restart the server to apply the new knowledge base.\n\n"
         else:
-            yield f"data: ❌ Process exited with code {exit_code}.\n\n"
-
+            yield f"data: ❌ Rebuild process exited with code {exit_code}.\n\n"
+ 
         yield "data: __DONE__\n\n"
-
+ 
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
@@ -509,22 +595,22 @@ async def run_rebuild():
 # ─────────────────────────────────────────────────────────────
 # ENDPOINT: /run-scraper
 # ─────────────────────────────────────────────────────────────
-
+ 
 @app.post("/run-scraper")
 async def run_scraper():
     SCRAPER_SCRIPT = "web_scraper.py"
-
+ 
     if not os.path.exists(SCRAPER_SCRIPT):
         async def error_stream():
             yield f"data: ❌ Scraper script '{SCRAPER_SCRIPT}' not found.\n\n"
             yield "data: __DONE__\n\n"
         return StreamingResponse(error_stream(), media_type="text/event-stream")
-
+ 
     return await stream_subprocess(["python", "-u", SCRAPER_SCRIPT])
 
 
 # ─────────────────────────────────────────────────────────────
-# ENDPOINT: /run-pipeline  — backwards compatibility alias
+# ENDPOINT: /run-pipeline 
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/run-pipeline")
@@ -533,13 +619,19 @@ async def run_pipeline_legacy():
 
 
 # ─────────────────────────────────────────────────────────────
-# RETRIEVER & LLM PIPELINE
+# RETRIEVER & LLM PIPELINE INITIALIZATION
 # ─────────────────────────────────────────────────────────────
 
-retriever = get_vectorstore().as_retriever(
-    search_type="mmr",
-    search_kwargs={"k": 3, "fetch_k": 10},
-)
+vs = get_vectorstore()
+if vs is not None:
+    retriever = vs.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 3, "fetch_k": 10},
+    )
+else:
+    retriever = None
+    print("⚠️  No vectorstore available — retriever not initialized.")
+
 
 print("🤖 Initializing Llama 3.2 text LLM...")
 llm = ChatOllama(model="llama3.2", temperature=0, num_ctx=4096)
@@ -552,80 +644,47 @@ print("✅ Vision LLM operational.")
 
 
 # ─────────────────────────────────────────────────────────────
-# SUPPORTED IMAGE MIME TYPES
+# METHOD 1: LLM-DRIVEN DYNAMIC QUERY EXPANSION ASSISTANT
 # ─────────────────────────────────────────────────────────────
 
-SUPPORTED_IMAGE_MIME_TYPES = {
-    "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp",
-}
-
-
-# ─────────────────────────────────────────────────────────────
-# VISION HELPER: FETCH & DESCRIBE AN IMAGE FROM A URL
-# ─────────────────────────────────────────────────────────────
-
-async def describe_image_from_url(image_url: str) -> str:
-    if not image_url or not image_url.startswith("http"):
-        return ""
-
+def expand_query_with_llm(user_query: str) -> list:
+    """
+    Uses the local LLM to rewrite and expand a student's question into multiple
+    official academic synonyms, solving word clashing ("coordinator" vs "leader").
+    """
+    expansion_prompt = f"""
+    You are an AI optimization assistant for a university search engine. 
+    Analyze the student's question and generate 2 to 3 alternative search queries that mean 
+    the exact same thing but use administrative vocabulary matching university documents (e.g., 
+    coordinator, leader, psm coordinator, committee chair, supervisor, logbook submission, passing marks).
+    
+    STRICT COMPILATION RULES:
+    1. Output ONLY a valid JSON list of strings.
+    2. Do NOT include introductory text, explanations, markdown backticks, or code formatting.
+    
+    Student Question: "{user_query}"
+    JSON Output:
+    """
     try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            resp = await client.get(image_url)
-
-        if resp.status_code != 200:
-            print(f"  ⚠️  Image URL returned HTTP {resp.status_code}: {image_url}")
-            return ""
-
-        content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
-        if content_type not in SUPPORTED_IMAGE_MIME_TYPES:
-            print(f"  ⚠️  Skipping non-image content-type '{content_type}': {image_url}")
-            return ""
-
-        MAX_BYTES = 5 * 1024 * 1024
-        if len(resp.content) > MAX_BYTES:
-            print(f"  ⚠️  Image too large ({len(resp.content) / 1024:.0f} KB), skipping: {image_url}")
-            return ""
-
-        image_b64 = base64.b64encode(resp.content).decode("utf-8")
-
-        vision_message = {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{content_type};base64,{image_b64}"},
-                },
-                {
-                    "type": "text",
-                    "text": (
-                        "You are reviewing an image from the PSM (Final Year Project) "
-                        "guideline website of Universiti Teknologi Malaysia (UTM), "
-                        "Faculty of Computing.\n\n"
-                        "Describe what this image shows in 2 to 3 concise sentences. "
-                        "Focus on any forms, diagrams, timelines, flowcharts, tables, "
-                        "or instructional content visible. "
-                        "If it is a decorative or logo image, say so briefly."
-                    ),
-                },
-            ],
-        }
-
-        print(f"  🔭 Sending image to vision LLM: {image_url[:80]}...")
-        vision_response = vision_llm.invoke([vision_message])
-        description = (
-            vision_response.content.strip()
-            if hasattr(vision_response, "content")
-            else str(vision_response).strip()
-        )
-        print(f"  📝 Vision description: {description[:120]}...")
-        return description
-
-    except httpx.TimeoutException:
-        print(f"  ⚠️  Timeout fetching image: {image_url}")
-        return ""
+        print("🧠 Translating casual terms via LLM Query Expansion pass...")
+        response = llm.invoke(expansion_prompt)
+        content = response.content.strip() if hasattr(response, "content") else str(response).strip()
+        
+        # Safe string cleaning if the local layout attaches code-block backticks
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+                
+        expanded_queries = json.loads(content.strip())
+        if isinstance(expanded_queries, list):
+            if user_query not in expanded_queries:
+                expanded_queries.insert(0, user_query)
+            return expanded_queries
     except Exception as e:
-        print(f"  ❌ Vision pipeline error for {image_url}: {str(e)}")
-        return ""
+        print(f"⚠️ Query Expansion skipped due to formatting constraints: {e}")
+        
+    return [user_query]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -641,6 +700,32 @@ VISUAL_INTENT_KEYWORDS = {
 def is_visual_question(question: str) -> bool:
     tokens = set(re.findall(r"\b\w+\b", question.lower()))
     return bool(tokens & VISUAL_INTENT_KEYWORDS)
+
+
+async def describe_image_from_url(url: str) -> str:
+    """Downloads an image from a URL and extracts text/markdown structure using LLaVA."""
+    try:
+        print(f"📸 Ingesting vision attachment asset: {url}")
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, timeout=10)
+            if response.status_code != 200:
+                return ""
+            img_b64 = base64.b64encode(response.content).decode("utf-8")
+            
+        prompt = (
+            "You are a precise academic document parser. Describe everything inside this image. "
+            "If it contains an administrative table or calendar milestone list, transcribe all items line-by-line verbatim."
+        )
+        res = await asyncio.to_thread(
+            ollama.generate,
+            model=VISION_MODEL,
+            prompt=prompt,
+            images=[img_b64]
+        )
+        return res.get("response", "").strip()
+    except Exception as vision_err:
+        print(f"⚠️ Vision analysis pipeline encountered an error: {vision_err}")
+        return ""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -666,12 +751,9 @@ Rules:
 7. Explain in simple student-friendly language.
 8. Do not copy entire paragraphs directly.
 9. Add emotion if necessary.
-10. If image descriptions are provided under 'Visual Context', use them
-    to enrich your answer when relevant.
 
 Always use proper line breaks between points.
 """
-
 
 # ─────────────────────────────────────────────────────────────
 # POST REQUEST SCHEMAS
@@ -688,7 +770,7 @@ def format_docs(documents: list) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# ENDPOINT: /predict  (Main RAG + Vision Pipeline)
+# ENDPOINT: /predict  (Advanced Multi-Query RAG + Fallback)
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/predict")
@@ -705,30 +787,66 @@ async def predict(request: ChatRequest):
                 "source": "error",
             }
 
-        if len(user_message.split()) < 2:
-            search_query = f"Tell me about {user_message} in PSM UTM guidelines"
-        else:
-            search_query = user_message
+        # ── STEP 1: DYNAMIC GENERATION OF EXPANDED QUERIES ──
+        search_queries = expand_query_with_llm(user_message)
+        print(f"🔍 EVALUATING PASS MULTI-QUERIES: {search_queries}")
 
-        print(f"🔍 RETRIEVAL QUERY: {search_query}")
+        # ── STEP 2: MULTI-PASS VECTOR RECOVERY DEDUPLICATION LOOP ──
+        retrieved_docs = []
+        seen_contents = set()
 
-        retrieved_docs = retriever.invoke(search_query)
+        for query in search_queries:
+            # Structurally align simple 1-2 word components with the template layout keys
+            if len(query.split()) <= 2:
+                formatted_query = f"Section Subheading Anchor: {query}"
+            else:
+                formatted_query = query
 
+            docs = retriever.invoke(formatted_query)
+            all_raw_docs = docs if 'docs' in locals() else []
+            for doc in docs:
+                if doc.page_content not in seen_contents:
+                    retrieved_docs.append(doc)
+                    seen_contents.add(doc.page_content)
+                    
+            if len(retrieved_docs) >= 4:
+                break
+
+        # ── STEP 3: HYBRID RAG LITERAL SUBSTRING PATTERN MATCH FALLBACK ──
+        # Activated for brief query tokens if semantic boundaries returned empty vector spaces
+        if not retrieved_docs and len(user_message.split()) <= 2:
+            print("🔄 Vector distance missed. Activating keyword layout backup scanning...")
+            try:
+                # Dynamically reference documents tracked in the memory sequence pool
+                all_raw_docs = docs if 'docs' in locals() else []
+                if not all_raw_docs:
+                    all_raw_docs = load_approved_knowledge_base()
+                    
+                fallback_matches = [
+                    doc for doc in all_raw_docs
+                    if user_message.lower() in doc.page_content.lower()
+                ]
+                retrieved_docs = fallback_matches[:3]
+            except Exception as fallback_err:
+                print(f"⚠️ Hybrid text parsing encountered error: {fallback_err}")
+
+        # Strict exit guardrail if zero matching chunks are detected in the repository loop
         if not retrieved_docs:
-            print("⚠️  No vector matches found.")
+            print("⚠️ Complete database search miss.")
             return {
                 "reply": "Sorry, I don't have that information inside my verified knowledge base.",
                 "source": "rag-ai",
             }
 
-        print(f"✅ Retrieved {len(retrieved_docs)} verified chunks")
+        print(f"✅ Context compilation matched {len(retrieved_docs)} verified records.")
         context = format_docs(retrieved_docs)
 
+        # ── STEP 4: VISION CONTEXT RECOVERY PIPELINE ──
         image_context_block = ""
         check_images = is_visual_question(user_message)
 
         if check_images:
-            print("🖼️  Visual intent detected — running image description pipeline...")
+            print("🖼️ Visual intent detected — running image description pipeline...")
             image_descriptions = []
 
             for doc in retrieved_docs:
@@ -748,11 +866,10 @@ async def predict(request: ChatRequest):
                     + "\n"
                 )
                 print(f"✅ {len(image_descriptions)} image description(s) injected into context.")
-            else:
-                print("ℹ️  No usable images found in retrieved documents.")
         else:
             print("⏩ Text-only question — skipping vision pipeline for speed.")
 
+        # ── STEP 5: STRUCTURAL FORMULATION & GENERATION ──
         final_prompt = (
             f"{SYSTEM_PROMPT}\n\n"
             f"Context:\n{context}"
@@ -760,7 +877,7 @@ async def predict(request: ChatRequest):
             f"Question:\n{user_message}"
         )
 
-        print("🐢 Invoking Llama 3.2 text generation...")
+        print("🐢 Invoking text model weights configuration parameter fields...")
         response = llm.invoke(final_prompt)
 
         if hasattr(response, "content"):

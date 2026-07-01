@@ -1,11 +1,11 @@
 """
-PSM UTM Web Scraper + Optimized LLaVA Vision Pipeline + Firestore Sync
+PSM UTM Web Scraper + Optimized Gemma 4 Vision Pipeline + Firestore Sync
 =====================================================================
 
 Features:
 ---------
 ✅ BFS crawl initialized via 'top-menu-nav' mapping discovery
-✅ LLaVA Vision schema guardrails producing perfect Markdown context tables
+✅ Gemma 4 Vision schema guardrails producing perfect Markdown context tables
 ✅ Target DOM isolation targeting (.entry-content, #main-content) to strip noise
 ✅ Auto-filtering of UI decor/logos using the [DECORATIVE_IMAGE] string gate
 ✅ Excludes element nodes with id="top-menu", id="main-footer", and id="sidebar" from chunking
@@ -53,8 +53,8 @@ HEADERS = {
 }
 
 # Vision model to use — must be pulled in Ollama first
-# Run: ollama pull llava
-VISION_MODEL = "llava:7b"
+# Run: ollama pull gemma4:e2b
+VISION_MODEL = "gemma4:e2b"
 
 # Pages where we force full vision processing (e.g. calendar/timeline pages)
 # Leave empty list [] to run vision on ALL pages
@@ -172,27 +172,26 @@ def download_image_as_base64(url: str, session: requests.Session):
 # ─────────────────────────────────────────────────────────────
 
 EXTRACTION_PROMPT = (
-    "You are a precise academic document parsing assistant. Extract ALL layout text fields from this image EXACTLY as written. You only need to copy it from the picture\n\n"
-    "CONTEXT & LAYOUT:\n"
-    "- This image is an academic milestone checklist or calendar grid for a UTM PSM (Final Year Project).\n"
-    "- The image has distinct layout segments: a main overarching Title block, followed by Subtitle/Category sections containing progress milestones and dates.\n\n"
-    "OUTPUT FORMAT REQUIREMENTS:\n"
-    "Your response must follow this markdown layout structure strictly:\n\n"
-    "# TITLE: [Extract and insert the exact main title text here]\n\n"
-    "## SUBTITLE / CATEGORY: [Extract and insert the subtitle or section heading here]\n"
-    "| Progress / Activity | Date(s) |\n"
-    "| --- | --- |\n"
-    "| [Activity 1 Text] | [Date 1 Text] |\n"
-    "| [Activity 2 Text] | [Date 2 Text] |\n\n"
-    "## SUBTITLE / CATEGORY: [Extract next section heading...]\n"
-    "...and so on for all blocks detected.\n\n"
-    "STRICT PARSING RULES:\n"
-    "1. Extract the main overarching image Title first and prepend it with a single markdown header token (#).\n"
-    "2. For every distinct block or grid segment, locate its Subtitle/Heading, output it with a double header (##), and map its activities into a dedicated two-column table.\n"
-    "3. Copy all dates character-for-character from the picture only(e.g., '20 to 23-APR-2026', NOT 'April 20-23'). Do not summarize date formats.\n"
-    "4. Do NOT paraphrase, infer, or summarize text. Missing values should be left as 'N/A' inside the table row cell.\n"
-    "5. List every progress item, benchmark milestone, or text instruction regardless of length.\n"
-    "6. If the image contains only a logo, web decorative vector graphic, or template layout without informational data, respond exactly with: [DECORATIVE_IMAGE]\n"
+    "You are an expert academic data extraction assistant. Your task is to perform an exact, "
+    "character-for-character structural extraction of the PSM Milestone Calendar shown in this image.\n\n"
+    
+    "CONTEXT INFORMATION:\n"
+    "- The image is an official schedule layout for an undergraduate Final Year Project (PSM) at UTM.\n"
+    "- It consists of colored blocks representing different phases.\n\n"
+    
+    "STRICT OUTPUT TEMPLATE:\n"
+    "Your response must begin with a single main markdown header (#) containing the exact title found in the top-left orange block of the image:\n"
+    "# PSM1 CALENDAR BRIEF SEM2_2526\n\n"
+    "Follow this immediately with a valid Markdown table using these 3 exact column headers to map the unstructured data into a structured timeline:\n\n"
+    "| Task / Event | Start Date | End Date |\n"
+    "| --- | --- | --- |\n"
+    "| [Row Data] | [Row Data] | [Row Data] |\n\n"
+    
+    "CRITICAL EXTRACTION RULES:\n"
+    "1. CHRONOLOGICAL COMPLETION: You must read the data from the colored blocks and map them chronologically into the table rows based on their dates (from April down to July). Do NOT skip any tasks or combine distinct milestones.\n"
+    "2. DATE & TEXT INTEGRITY: Copy text and actions exactly as written in the blocks. Split date ranges (e.g., '6to9-APR-2026' or '11 to 15-MAY-2026') into distinct 'Start Date' and 'End Date' columns for precision. For single-day events, use the same date for both columns.\n"
+    "3. NO DISCURSIVE PROSE: Do not output introductory text, conversational greetings, or ending notes. Output only the clean Markdown structural content block.\n"
+    "4. EXPLICIT N/A: If any date or event parameter is completely missing, write 'N/A' inside that specific cell row. Do not leave empty table formatting gaps."
 )
 
 def _run_vision_prompt(image_b64: str, prompt: str) -> str | None:
@@ -212,12 +211,12 @@ def _run_vision_prompt(image_b64: str, prompt: str) -> str | None:
         )
         return response["message"]["content"].strip()
     except Exception as e:
-        print(f"    [ollama raw error] {e}")
+        print(f"    [Gemma 4 integration error] {e}")
         return None
 
 
-def describe_image_with_llava(image_b64: str, image_url: str = "") -> str | None:
-    """Two-pass extraction: extract then verify."""
+def describe_image_with_gemma(image_b64: str, image_url: str = "") -> str | None:
+    """Two-pass extraction: extract then verify using Gemma 4."""
 
     # Pass 1: Raw extraction
     first_pass = _run_vision_prompt(image_b64, prompt=EXTRACTION_PROMPT)
@@ -273,21 +272,21 @@ def process_page_images(soup: BeautifulSoup, page_url: str, session: requests.Se
             print(f"    [skip] Image download failed or too small.")
             continue
 
-        description = describe_image_with_llava(img_b64, full_url)
+        description = describe_image_with_gemma(img_b64, full_url)
 
         if description:
             if "[DECORATIVE_IMAGE]" in description:
-                print(f"    🗑️  LLaVA marked image as decorative banner. Filtered out.")
+                print(f"    🗑️  Gemma 4 marked image as decorative banner. Filtered out.")
                 continue
 
-            print(f"    ✅ LLaVA described image ({len(description)} chars)")
+            print(f"    ✅ Gemma 4 described image ({len(description)} chars)")
             image_context_list.append({
                 "url":         full_url,
                 "description": description,
                 "processed_at": datetime.now().isoformat(),
             })
         else:
-            print(f"    ⚠️  LLaVA returned no description.")
+            print(f"    ⚠️  Gemma 4 returned no description.")
 
     return picture_links, image_context_list
 
@@ -498,7 +497,7 @@ def _build_section(
     page_title, url, path_string, heading,
     text_blocks, picture_links, image_context_list,
     image_context_text, doc_links,
-    menu_entry: dict,   # ← NEW: originating top-menu-nav entry
+    menu_entry: dict,   # originating top-menu-nav entry
 ) -> dict:
     full_content_blocks = list(text_blocks)
     if image_context_text:
@@ -515,7 +514,7 @@ def _build_section(
         "doc_links":     doc_links,
         "approved":      False,
         "scraped_at":    datetime.now().isoformat(),
-        # ── NEW FIELDS ──────────────────────────────────────────
+        # ── NAVIGATION FIELDS ──────────────────────────────────────────
         "menu_group":       menu_entry["label"],   # e.g. "About PSM", "Guidelines"
         "menu_group_url":   menu_entry["url"],     # originating nav URL
         "menu_group_order": menu_entry["order"],   # position in top-menu-nav (0-indexed)

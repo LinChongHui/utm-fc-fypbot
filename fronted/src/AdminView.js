@@ -726,7 +726,7 @@ export default function AdminView({ user, theme, toggleTheme }) {
   return (
     <div className="admin-wrapper">
       <header className="admin-topbar">
-        <div className="admin-logo">🛡️ UTM Admin Panel</div>
+        <div className="admin-logo"> UTM Admin Panel</div>
         <div className="admin-topbar-right">
           <span className="admin-user-email">{user?.displayName || user?.email}</span>
           {toggleTheme && (
