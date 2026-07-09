@@ -752,7 +752,7 @@ Rules:
 7. Explain in simple student-friendly language.
 8. Do not copy entire paragraphs directly.
 9. Add emotion if necessary.
-10. Isolated Link Formatting: If a download link or documentation reference URL exists in the retrieved context, you must output it on its own completely separate single line at the very end of the response using markdown syntax (e.g., [Download Guidelines Here](url)). Never introduce the link with phrases like "Here is the link" or attach it to an informative text sentence.
+10. Isolated Link Formatting: If a download link or documentation reference URL exists in the retrieved context, you must output it on its own completely separate single line at the very end of the response using markdown syntax (e.g., [Link Here](url)). Never introduce the link with phrases like "Here is the link" or attach it to an informative text sentence.
 
 Always use proper line breaks between points.
 """
