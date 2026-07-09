@@ -977,3 +977,12 @@ body {
   padding-bottom: 2rem;
 }
 
+.bubble a {
+  color: #4f9dff;
+  text-decoration: underline;
+  word-break: break-all;
+}
+
+[data-theme="light"] .bubble a {
+  color: #1a56db;
+}

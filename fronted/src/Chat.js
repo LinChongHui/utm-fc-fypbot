@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { auth } from './firebase';
 import { signOut } from "firebase/auth";
 import axios from 'axios';
+import DOMPurify from 'dompurify';
 import utmLogo from './assets/utm-logo.png';
 
 import './App.css'; 
@@ -50,6 +51,28 @@ function Chat({ user, theme, toggleTheme }) {
     if (e.key === 'Enter') handleSend();
   };
 
+  // Converts markdown links, plain URLs, newlines, and bullets into safe HTML
+  const formatMessage = (text) => {
+    let formatted = text
+      // 1. Markdown-style links: [text](url)
+      .replace(
+        /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+        '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
+      )
+      // 2. Plain URLs not already inside an <a> tag
+      .replace(
+        /(?<!href=")(https?:\/\/[^\s<]+)/g,
+        '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>'
+      )
+      // 3. Newlines
+      .replace(/\n/g, '<br/>')
+      // 4. Bullets
+      .replace(/•\s*/g, '<br/>• ')
+      .replace(/^<br\/>/, '');
+
+    return DOMPurify.sanitize(formatted, { ADD_ATTR: ['target', 'rel'] });
+  };
+
   if (!user) return null;
 
   return (
@@ -96,12 +119,7 @@ function Chat({ user, theme, toggleTheme }) {
             <div key={i} className={`bubble ${m.role}`}>
               {m.role === 'ai' ? (
                 <span
-                  dangerouslySetInnerHTML={{
-                    __html: m.text
-                      .replace(/\n/g, '<br/>')
-                      .replace(/•\s*/g, '<br/>• ')
-                      .replace(/^<br\/>/, '')
-                  }}
+                  dangerouslySetInnerHTML={{ __html: formatMessage(m.text) }}
                 />
               ) : (
                 m.text

@@ -57,7 +57,88 @@ function getNavIndex(section) {
   return NAV_MENU.length;
 }
 
-function groupSectionsByNav(sections) {
+// ─────────────────────────────────────────────────────────────
+// RICH TEXT HELPERS
+// ─────────────────────────────────────────────────────────────
+// Detects whether a content string is already HTML (new rich-text format)
+// vs legacy plain text (scraped/entered before rich text existed).
+function isHtmlContent(str) {
+  if (!str) return false;
+  return /<\/?[a-z][\s\S]*>/i.test(str);
+}
+
+// Converts legacy plain text (with \n\n paragraph breaks) into basic HTML
+// paragraphs, so it can be loaded into the rich text editor without losing
+// its original line breaks.
+function plainTextToHtml(text) {
+  if (!text) return '';
+  return text
+    .split(/\n{2,}/)
+    .map(para => `<p>${para.replace(/\n/g, '<br>')}</p>`)
+    .join('');
+}
+
+// Strips tags to get plain text — used for "is this field actually empty?"
+// checks, since an HTML string like "<p><br></p>" isn't empty as a string
+// but has no visible content.
+function stripHtml(html) {
+  if (!html) return '';
+  const tmp = document.createElement('div');
+  tmp.innerHTML = html;
+  return (tmp.textContent || tmp.innerText || '').trim();
+}
+
+// Repairs the "list nested inside a list item" markup that browsers can
+// produce via execCommand (the bug where item 2 and 3 render indented
+// under item 1 instead of lining up with it). Walks the HTML, and for
+// every <ul>/<ol> found nested inside an <li>, splits the parent list at
+// that point and re-inserts the nested list as a sibling — continuing
+// the outer list's numbering correctly afterward.
+function normalizeNestedLists(html) {
+  if (!html) return html;
+  const container = document.createElement('div');
+  container.innerHTML = html;
+
+  let safety = 0;
+  while (safety < 500) {
+    const nested = container.querySelector('li > ul, li > ol');
+    if (!nested) break;
+    safety++;
+
+    const li = nested.parentElement;
+    const parentList = li.parentElement; // the ul/ol that holds `li`
+    const grandParent = parentList ? parentList.parentElement : null;
+    if (!parentList || !grandParent) break;
+
+    li.removeChild(nested); // detach nested list from the item
+
+    const siblings   = Array.from(parentList.children);
+    const idx        = siblings.indexOf(li);
+    const afterItems = siblings.slice(idx + 1);
+    const refNode    = parentList.nextSibling;
+
+    if (afterItems.length === 0) {
+      // Nothing follows this item — just place the nested list right after.
+      grandParent.insertBefore(nested, refNode);
+    } else {
+      // Items follow — split them into a new list that continues numbering.
+      const tag = parentList.tagName; // 'UL' or 'OL'
+      const afterList = document.createElement(tag);
+      if (tag === 'OL') {
+        const originalStart = parseInt(parentList.getAttribute('start') || '1', 10);
+        afterList.setAttribute('start', String(originalStart + idx + 1));
+      }
+      afterItems.forEach(item => afterList.appendChild(item));
+
+      grandParent.insertBefore(nested, refNode);
+      grandParent.insertBefore(afterList, refNode);
+    }
+  }
+
+  return container.innerHTML;
+}
+
+function groupSectionsByNav(sections, direction = 'asc') {
   const buckets = {};
   for (const s of sections) {
     const idx = getNavIndex(s);
@@ -70,7 +151,9 @@ function groupSectionsByNav(sections) {
     }
     buckets[idx].sections.push(s);
   }
-  return Object.values(buckets).sort((a, b) => a.navIndex - b.navIndex);
+  return Object.values(buckets).sort((a, b) =>
+    direction === 'asc' ? a.navIndex - b.navIndex : b.navIndex - a.navIndex
+  );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -271,6 +354,142 @@ function ImageContextPanel({ imageContext, sectionId, onUpdateImageContext }) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// RICH TEXT EDITOR
+// ─────────────────────────────────────────────────────────────
+// Small, dependency-free WYSIWYG editor built on contentEditable +
+// document.execCommand. Supports Bold, Italic, Underline, Headings,
+// and numbered/bulleted lists — enough for formatting KB content
+// without pulling in an external editor library.
+function RichTextEditor({ value, onChange, minHeight = 380, placeholder = 'Start typing content…' }) {
+  const editorRef = useRef(null);
+
+  // Only push `value` into the DOM when it differs from what's already
+  // there — this keeps the caret from jumping around while typing, since
+  // onInput already updates the parent with the current DOM content.
+  useEffect(() => {
+    if (editorRef.current && editorRef.current.innerHTML !== (value || '')) {
+      editorRef.current.innerHTML = value || '';
+    }
+  }, [value]);
+
+  const exec = (command, arg = null) => {
+    editorRef.current?.focus();
+
+    // Toggling list type (numbered ↔ bulleted) while the caret is still
+    // inside an existing list item is what makes browsers nest the new
+    // list inside the old <li> instead of replacing it — that's the
+    // "item 2 and 3 indented under item 1" bug. Resetting the current
+    // block to a plain paragraph first removes that list context, so
+    // the new list starts flat instead of nesting.
+    if (command === 'insertOrderedList' || command === 'insertUnorderedList') {
+      document.execCommand('formatBlock', false, 'P');
+    }
+
+    document.execCommand(command, false, arg);
+    onChange(editorRef.current.innerHTML);
+  };
+
+  const handleInput = () => onChange(editorRef.current.innerHTML);
+
+  const ToolbarBtn = ({ onClick, title, children }) => (
+    <button
+      type="button"
+      onMouseDown={(e) => e.preventDefault()} // keeps text selection/focus inside the editor
+      onClick={onClick}
+      title={title}
+      style={{
+        border: '1px solid var(--border)',
+        background: 'var(--bg-surface)',
+        color: 'var(--text-primary)',
+        borderRadius: 5,
+        padding: '5px 9px',
+        fontSize: 12,
+        fontWeight: 700,
+        cursor: 'pointer',
+        lineHeight: 1,
+      }}
+    >
+      {children}
+    </button>
+  );
+
+  return (
+    <div style={{ border: '1px solid var(--border)', borderRadius: 8, overflow: 'hidden' }}>
+      <style>{`
+        .rich-text-editor, .kb-rich-content {
+          width: 100%;
+          box-sizing: border-box;
+          overflow-wrap: break-word;
+          word-wrap: break-word;
+          word-break: break-word;
+        }
+        .rich-text-editor h1, .kb-rich-content h1 { font-size: 20px; font-weight: 700; margin: 14px 0 8px; }
+        .rich-text-editor h2, .kb-rich-content h2 { font-size: 17px; font-weight: 700; margin: 12px 0 6px; }
+        .rich-text-editor h3, .kb-rich-content h3 { font-size: 15px; font-weight: 600; margin: 10px 0 5px; }
+        .rich-text-editor h4, .kb-rich-content h4 { font-size: 13px; font-weight: 600; margin: 8px 0 4px; text-transform: uppercase; letter-spacing: 0.03em; color: var(--text-secondary, var(--text-primary)); }
+        .rich-text-editor p,  .kb-rich-content p  { margin: 0 0 10px; overflow-wrap: break-word; }
+        .rich-text-editor ul, .kb-rich-content ul { margin: 6px 0 10px 22px; padding: 0; max-width: 100%; }
+        .rich-text-editor ol, .kb-rich-content ol { margin: 6px 0 10px 22px; padding: 0; max-width: 100%; }
+        .rich-text-editor li, .kb-rich-content li { margin-bottom: 4px; overflow-wrap: break-word; }
+        .rich-text-editor:empty:before { content: attr(data-placeholder); color: var(--text-muted); pointer-events: none; }
+      `}</style>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center', padding: '8px 10px', background: 'var(--bg-surface)', borderBottom: '1px solid var(--border)' }}>
+        <select
+          onMouseDown={(e) => e.stopPropagation()}
+          onChange={(e) => { exec('formatBlock', e.target.value); e.target.value = ''; }}
+          defaultValue=""
+          title="Text style"
+          style={{
+            border: '1px solid var(--border)',
+            background: 'var(--bg-surface)',
+            color: 'var(--text-primary)',
+            borderRadius: 5,
+            padding: '5px 8px',
+            fontSize: 12,
+            fontWeight: 600,
+            cursor: 'pointer',
+          }}
+        >
+          <option value="" disabled>Text style…</option>
+          <option value="P">Normal text</option>
+          <option value="H2">Heading 1</option>
+          <option value="H3">Heading 2</option>
+          <option value="H4">Heading 3</option>
+        </select>
+        <span style={{ width: 1, background: 'var(--border)', margin: '2px 2px' }} />
+        <ToolbarBtn onClick={() => exec('bold')} title="Bold"><b>B</b></ToolbarBtn>
+        <ToolbarBtn onClick={() => exec('italic')} title="Italic"><i>I</i></ToolbarBtn>
+        <ToolbarBtn onClick={() => exec('underline')} title="Underline"><u>U</u></ToolbarBtn>
+        <span style={{ width: 1, background: 'var(--border)', margin: '2px 2px' }} />
+        <ToolbarBtn onClick={() => exec('insertUnorderedList')} title="Bullet list">• List</ToolbarBtn>
+        <ToolbarBtn onClick={() => exec('insertOrderedList')} title="Numbered list">1. List</ToolbarBtn>
+        <span style={{ width: 1, background: 'var(--border)', margin: '2px 2px' }} />
+        <ToolbarBtn onClick={() => exec('removeFormat')} title="Clear formatting">Clear</ToolbarBtn>
+      </div>
+      <div
+        ref={editorRef}
+        className="rich-text-editor"
+        contentEditable
+        suppressContentEditableWarning
+        data-placeholder={placeholder}
+        onInput={handleInput}
+        style={{
+          minHeight,
+          maxHeight: 600,
+          overflowY: 'auto',
+          padding: 12,
+          fontSize: 14,
+          lineHeight: 1.7,
+          color: 'var(--text-primary)',
+          background: 'transparent',
+          outline: 'none',
+        }}
+      />
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
 // KB ROW
 // ─────────────────────────────────────────────────────────────
 function KbRow({ section, onSave, onDelete, onToggleApproval }) {
@@ -280,12 +499,16 @@ function KbRow({ section, onSave, onDelete, onToggleApproval }) {
 
   const startEdit = (e) => {
     e.stopPropagation();
+    const rawContent = section.content ?? '';
     setDraft({
       page_title:    section.page_title    ?? '',
       page_url:      section.page_url      ?? '',
       path:          section.path          ?? '',
       heading:       section.heading       ?? '',
-      content:       section.content       ?? '',
+      // Legacy sections store plain text; convert to HTML. Sections with
+      // HTML already get their nested-list markup repaired here too, so
+      // re-saving after edit permanently fixes the underlying data.
+      content:       isHtmlContent(rawContent) ? normalizeNestedLists(rawContent) : plainTextToHtml(rawContent),
       picture_links: (section.picture_links ?? []).join('\n'),
       doc_links:     (section.doc_links     ?? []).join('\n'),
     });
@@ -302,7 +525,7 @@ function KbRow({ section, onSave, onDelete, onToggleApproval }) {
       page_url:      draft.page_url.trim(),
       path:          draft.path.trim(),
       heading:       draft.heading.trim(),
-      content:       draft.content.trim(),
+      content:       normalizeNestedLists(draft.content.trim()),
       picture_links: draft.picture_links.split('\n').map(s => s.trim()).filter(Boolean),
       doc_links:     draft.doc_links.split('\n').map(s => s.trim()).filter(Boolean),
     };
@@ -317,11 +540,12 @@ function KbRow({ section, onSave, onDelete, onToggleApproval }) {
   const handleDelete   = (e) => { e.stopPropagation(); onDelete(section.id); };
   const handleApproval = (e) => { e.stopPropagation(); onToggleApproval(section); };
 
-  const field = (key, label, rows = 1, hint = '') => (
+  const field = (key, label, rows = 1, hint = '', textareaStyle = {}) => (
     <div className="kb-field">
       <span className="kb-field-label">{label}{hint && <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}> — {hint}</span>}</span>
       {rows > 1
-        ? <textarea className="form-textarea" rows={rows} value={draft[key] ?? ''} onChange={e => setDraft(p => ({ ...p, [key]: e.target.value }))} />
+        ? <textarea className="form-textarea" rows={rows} value={draft[key] ?? ''} onChange={e => setDraft(p => ({ ...p, [key]: e.target.value }))}
+            style={{ width: '100%', resize: 'vertical', ...textareaStyle }} />
         : <input    className="form-input"                value={draft[key] ?? ''} onChange={e => setDraft(p => ({ ...p, [key]: e.target.value }))} />
       }
     </div>
@@ -363,7 +587,14 @@ function KbRow({ section, onSave, onDelete, onToggleApproval }) {
                 {field('page_url', 'Page URL')}
                 {field('path',     'Path')}
               </div>
-              {field('content',       'Content',        7)}
+              <div className="kb-field">
+                <span className="kb-field-label">Content</span>
+                <RichTextEditor
+                  value={draft.content ?? ''}
+                  onChange={(html) => setDraft(p => ({ ...p, content: html }))}
+                  minHeight={380}
+                />
+              </div>
               {field('picture_links', 'Picture Links',  3, 'one URL per line')}
               {field('doc_links',     'Document Links', 3, 'one URL per line')}
               {imageContextCount > 0 && (
@@ -388,9 +619,15 @@ function KbRow({ section, onSave, onDelete, onToggleApproval }) {
               </div>
               <div className="kb-field">
                 <span className="kb-field-label">Content</span>
-                <p style={{ fontSize: 13, color: 'var(--text-primary)', lineHeight: 1.7, borderLeft: '2px solid var(--border-hover)', paddingLeft: 10 }}>
-                  {section.content || <em style={{ color: 'var(--text-muted)' }}>No content.</em>}
-                </p>
+                <div style={{ fontSize: 13, color: 'var(--text-primary)', lineHeight: 1.7, borderLeft: '2px solid var(--border-hover)', paddingLeft: 10, width: '100%', maxWidth: '100%', boxSizing: 'border-box', overflowWrap: 'break-word' }}>
+                  {!section.content ? (
+                    <em style={{ color: 'var(--text-muted)' }}>No content.</em>
+                  ) : isHtmlContent(section.content) ? (
+                    <div className="kb-rich-content" dangerouslySetInnerHTML={{ __html: normalizeNestedLists(section.content) }} />
+                  ) : (
+                    <p style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{section.content}</p>
+                  )}
+                </div>
               </div>
               <ImageContextPanel imageContext={section.image_context} sectionId={section.id} onUpdateImageContext={handleUpdateImageContext} />
               <div className="kb-field">
@@ -463,12 +700,13 @@ export default function AdminView({ user, theme, toggleTheme }) {
   const [searchTerm, setSearchTerm] = useState('');
   const [viewMode,   setViewMode]   = useState('nav');
 
-  // ── AI Generate tab ──                          ← single declaration, no duplicates
+  // ── AI Generate tab ──
   const [genRunning,   setGenRunning]   = useState(false);
   const [genLog,       setGenLog]       = useState([]);
   const [genProgress,  setGenProgress]  = useState(0);
   const [activeTask,   setActiveTask]   = useState(null); // 'rebuild' | 'scrape' | null
   const logEndRef = useRef(null);                         // auto-scroll anchor
+  const abortControllerRef = useRef(null);                // lets us cancel the running task client-side
 
   // ── Status flash ──
   const [statusMsg, setStatusMsg] = useState('');
@@ -503,7 +741,7 @@ export default function AdminView({ user, theme, toggleTheme }) {
   const pendingFilteredSections = filteredSections.filter(s => !s.approved);
   const navGroups = groupSectionsByNav(filteredSections);
 
-  // ── Auto-scroll log terminal ──                 ← correctly inside the component
+  // ── Auto-scroll log terminal ──
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [genLog]);
@@ -617,7 +855,7 @@ export default function AdminView({ user, theme, toggleTheme }) {
   };
 
   const addSection = async () => {
-    if (!newSection.page_title.trim() || !newSection.content.trim()) {
+    if (!newSection.page_title.trim() || !stripHtml(newSection.content)) {
       flash('Page title and content are required.');
       return;
     }
@@ -626,7 +864,7 @@ export default function AdminView({ user, theme, toggleTheme }) {
       page_url:      newSection.page_url.trim(),
       path:          newSection.path.trim(),
       heading:       newSection.heading.trim(),
-      content:       newSection.content.trim(),
+      content:       normalizeNestedLists(newSection.content.trim()),
       picture_links: newSection.picture_links.split('\n').map(s => s.trim()).filter(Boolean),
       doc_links:     newSection.doc_links.split('\n').map(s => s.trim()).filter(Boolean),
       image_context: [],
@@ -650,6 +888,10 @@ export default function AdminView({ user, theme, toggleTheme }) {
     const endpoint = task === 'scrape' ? '/run-scraper' : '/run-rebuild';
     const label    = task === 'scrape' ? '🕷️ Web Scraper' : '🔄 Chroma Rebuild';
 
+    // Fresh AbortController for this run — lets cancelTask() interrupt the fetch/stream
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setGenRunning(true);
     setActiveTask(task);
     setGenLog([{ id: Date.now(), text: `🚀 Starting ${label}...`, type: 'info' }]);
@@ -659,6 +901,7 @@ export default function AdminView({ user, theme, toggleTheme }) {
       const response = await fetch(`http://127.0.0.1:8000${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
       });
 
       if (!response.ok) throw new Error(`Server returned ${response.status}`);
@@ -684,6 +927,7 @@ export default function AdminView({ user, theme, toggleTheme }) {
             setGenProgress(100);
             setGenRunning(false);
             setActiveTask(null);
+            abortControllerRef.current = null;
             flash(`${label} finished ✓`);
             return;
           }
@@ -712,12 +956,35 @@ export default function AdminView({ user, theme, toggleTheme }) {
         }
       }
     } catch (err) {
+      if (err.name === 'AbortError') {
+        // Cancelled via cancelTask() — that function already logs/flashes, so stay quiet here
+        return;
+      }
       setGenLog(prev => [...prev, { id: Date.now(), text: `❌ ${err.message}`, type: 'error' }]);
       flash('Task failed.');
     } finally {
       setGenRunning(false);
       setActiveTask(null);
+      abortControllerRef.current = null;
     }
+  };
+
+  // Cancels the running task: aborts the client-side fetch/stream immediately,
+  // and also asks the backend to terminate the underlying process (best-effort).
+  const cancelTask = async () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    try {
+      await fetch('http://127.0.0.1:8000/cancel-task', { method: 'POST' });
+    } catch (_) {
+      // best effort — client already stopped listening regardless of backend response
+    }
+    setGenLog(prev => [...prev, { id: Date.now(), text: '🛑 Task cancelled by user.', type: 'warn' }]);
+    setGenRunning(false);
+    setActiveTask(null);
+    abortControllerRef.current = null;
+    flash('Task cancelled.');
   };
 
   // ─────────────────────────────────────────────────────────────
@@ -889,7 +1156,14 @@ export default function AdminView({ user, theme, toggleTheme }) {
                   <input className="form-input" placeholder="Page URL…"     value={newSection.page_url}  onChange={e => setNewSection(p => ({ ...p, page_url: e.target.value }))} />
                   <input className="form-input" placeholder="Path (e.g. /psm/about/)…" value={newSection.path} onChange={e => setNewSection(p => ({ ...p, path: e.target.value }))} />
                 </div>
-                <textarea className="form-textarea" placeholder="Content…" rows={5} value={newSection.content} onChange={e => setNewSection(p => ({ ...p, content: e.target.value }))} />
+                <div style={{ marginTop: 4 }}>
+                  <RichTextEditor
+                    value={newSection.content}
+                    onChange={(html) => setNewSection(p => ({ ...p, content: html }))}
+                    minHeight={220}
+                    placeholder="Content…"
+                  />
+                </div>
                 <textarea className="form-textarea" placeholder="Picture links (one per line)…" rows={2} value={newSection.picture_links} onChange={e => setNewSection(p => ({ ...p, picture_links: e.target.value }))} />
                 <textarea className="form-textarea" placeholder="Document links (one per line)…" rows={2} value={newSection.doc_links} onChange={e => setNewSection(p => ({ ...p, doc_links: e.target.value }))} />
                 <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: '4px 0 0' }}>
@@ -991,6 +1265,22 @@ export default function AdminView({ user, theme, toggleTheme }) {
                   }}>
                   {activeTask === 'rebuild' ? '⏳ Rebuilding…' : '🔄 Rebuild Chroma DB'}
                 </button>
+
+                {genRunning && (
+                  <button onClick={cancelTask}
+                    style={{
+                      background: '#e63946',
+                      color: '#fff',
+                      border: 'none',
+                      padding: '10px 20px',
+                      borderRadius: 8,
+                      fontWeight: 700,
+                      fontSize: 13,
+                      cursor: 'pointer',
+                    }}>
+                    ✕ Cancel Task
+                  </button>
+                )}
 
                 {genLog.length > 0 && !genRunning && (
                   <button onClick={() => { setGenLog([]); setGenProgress(0); }}
